@@ -1,0 +1,3 @@
+display_name: Using Serial Devices
+short_description: Automate serial device I/O over TTY/COM ports.
+default_prompt: Help me monitor a serial device, interact with it safely, and return structured results.
