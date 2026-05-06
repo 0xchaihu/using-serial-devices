@@ -461,11 +461,53 @@ def cmd_monitor_wait(args):
 
 def pid_alive(pid):
     try:
+        pid = int(pid)
+    except Exception:
+        return False
+    try:
         if os.name == "nt":
-            r = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True)
-            return str(pid) in r.stdout
+            import ctypes
+            SYNCHRONIZE = 0x00100000
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            WAIT_TIMEOUT = 0x00000102
+            handle = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return False
+            try:
+                return ctypes.windll.kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
         os.kill(pid, 0)
         return True
+    except Exception:
+        return False
+
+
+def terminate_pid(pid):
+    try:
+        pid = int(pid)
+    except Exception:
+        return False
+    try:
+        if os.name == "nt":
+            import ctypes
+            PROCESS_TERMINATE = 0x0001
+            SYNCHRONIZE = 0x00100000
+            WAIT_TIMEOUT = 0x00000102
+            handle = ctypes.windll.kernel32.OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, False, pid)
+            if not handle:
+                return False
+            try:
+                if not ctypes.windll.kernel32.TerminateProcess(handle, 1):
+                    return False
+                return ctypes.windll.kernel32.WaitForSingleObject(handle, 2000) != WAIT_TIMEOUT
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
+        os.kill(pid, signal.SIGTERM)
+        time.sleep(0.5)
+        if pid_alive(pid):
+            os.kill(pid, signal.SIGKILL)
+        return not pid_alive(pid)
     except Exception:
         return False
 
@@ -499,17 +541,7 @@ def cmd_monitor_stop(args):
     pid = meta.get("pid")
     stopped = False
     if pid and pid_alive(pid):
-        try:
-            if os.name == "nt":
-                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
-            else:
-                os.kill(pid, signal.SIGTERM)
-                time.sleep(0.5)
-                if pid_alive(pid):
-                    os.kill(pid, signal.SIGKILL)
-            stopped = True
-        except Exception:
-            stopped = False
+        stopped = terminate_pid(pid)
     events, offset = iter_events(event_log, 0)
     emit(result("monitor stop", True, {"session_id": args.session, "pid": pid, "stopped": stopped, "event_count": len(events), "event_log": str(event_log), "raw_log": str(raw_log)}), args.json)
     return 0
@@ -676,3 +708,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
