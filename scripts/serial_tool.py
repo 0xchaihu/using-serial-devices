@@ -15,6 +15,8 @@ import tempfile
 import threading
 import time
 import uuid
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 try:
@@ -35,6 +37,7 @@ EXIT_DEP = 5
 SESSION_ROOT = Path(tempfile.gettempdir()) / "using-serial-devices"
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 MATCH_BUFFER_LIMIT = 65536
+ALERT_WEBHOOK_ENV = "USING_SERIAL_DEVICES_ALERT_WEBHOOK"
 
 
 def now_iso():
@@ -111,6 +114,84 @@ def open_serial(args):
     )
 
 
+class RotatingBinaryLog:
+    """Append-only binary log with size-based backup rotation."""
+
+    def __init__(self, path, max_bytes=0, backups=3):
+        self.path = Path(path)
+        self.max_bytes = max(0, int(max_bytes or 0))
+        self.backups = max(0, int(backups or 0))
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = self.path.open("ab")
+
+    def _rotate(self, incoming):
+        if not self.max_bytes or self.backups <= 0:
+            return
+        current = self.path.stat().st_size if self.path.exists() else 0
+        if current == 0 or current + incoming <= self.max_bytes:
+            return
+        self._file.close()
+        oldest = Path(f"{self.path}.{self.backups}")
+        oldest.unlink(missing_ok=True)
+        for index in range(self.backups - 1, 0, -1):
+            source = Path(f"{self.path}.{index}")
+            if source.exists():
+                source.replace(Path(f"{self.path}.{index + 1}"))
+        self.path.replace(Path(f"{self.path}.1"))
+        self._file = self.path.open("ab")
+
+    def write(self, data):
+        self._rotate(len(data))
+        self._file.write(data)
+        self._file.flush()
+
+    def flush(self):
+        self._file.flush()
+
+    def close(self):
+        self._file.close()
+
+
+def open_raw_log(args):
+    if not getattr(args, "log", None):
+        return None
+    return RotatingBinaryLog(
+        args.log,
+        getattr(args, "log_max_bytes", 0),
+        getattr(args, "log_backups", 3),
+    )
+
+
+def compile_alert_patterns(patterns):
+    compiled = []
+    for index, pattern in enumerate(patterns or [], start=1):
+        compiled.append((f"rule-{index}", pattern, re.compile(pattern)))
+    return compiled
+
+
+def post_alert_webhook(url, payload, timeout=3.0):
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError("alert webhook must be an absolute http(s) URL")
+    webhook_payload = dict(payload)
+    if "text" not in webhook_payload:
+        if payload.get("kind") == "pattern":
+            webhook_payload["text"] = f"Serial alert: {payload.get('match')} in {payload.get('line', '')}"
+        elif payload.get("kind") == "silence":
+            webhook_payload["text"] = f"Serial alert: no data for {payload.get('silence_seconds')} seconds"
+        else:
+            webhook_payload["text"] = "Serial monitor alert"
+    body = json.dumps(webhook_payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json", "User-Agent": "using-serial-devices/1"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return int(getattr(response, "status", 200))
+
+
 def cmd_list(args):
     if not require_pyserial("list", args.json):
         return EXIT_DEP
@@ -159,8 +240,9 @@ def read_loop(args, ser, command="read", event_writer=None):
     pattern = re.compile(args.expect) if args.expect else None
     matched = None
     reason = "completed"
-    raw_log = open(args.log, "ab") if args.log else None
+    raw_log = open_raw_log(args)
     retain_history = event_writer is None and not args.jsonl
+    silence_emitted = False
 
     def write_event(ev):
         if event_writer:
@@ -184,6 +266,7 @@ def read_loop(args, ser, command="read", event_writer=None):
             current = time.time()
             if data:
                 last_data = current
+                silence_emitted = False
                 total += len(data)
                 if retain_history:
                     all_bytes.extend(data)
@@ -203,6 +286,10 @@ def read_loop(args, ser, command="read", event_writer=None):
                     line_buf = parts.pop()
                 else:
                     line_buf = ""
+                if len(line_buf) > MATCH_BUFFER_LIMIT:
+                    dropped = len(line_buf) - MATCH_BUFFER_LIMIT
+                    line_buf = line_buf[-MATCH_BUFFER_LIMIT:]
+                    write_event({"event": "buffer_truncated", "buffer": "line", "dropped_characters": dropped, "time": now_iso()})
                 for part in parts:
                     emit_line(part.rstrip("\r\n"))
 
@@ -221,6 +308,15 @@ def read_loop(args, ser, command="read", event_writer=None):
                 if matched:
                     reason = "matched"
                     break
+            silence_timeout = getattr(args, "silence_timeout", None)
+            if silence_timeout and not silence_emitted and current - last_data >= silence_timeout:
+                write_event({
+                    "event": "alert",
+                    "kind": "silence",
+                    "silence_seconds": round(current - last_data, 3),
+                    "time": now_iso(),
+                })
+                silence_emitted = True
             if args.seconds is not None and current - started >= args.seconds:
                 reason = "seconds"
                 break
@@ -343,28 +439,95 @@ def read_json(path):
 def cmd_monitor_start(args):
     if not require_pyserial("monitor start", args.json):
         return EXIT_DEP
+    if args.log_max_bytes < 0 or args.log_backups < 0 or args.reconnect_delay < 0 or args.reconnect_max_attempts < 0 or args.alert_cooldown < 0:
+        emit(result("monitor start", False, error=err_obj("ValueError", "monitor limits and delays must be non-negative", "Fix the monitor start arguments.")), args.json)
+        return EXIT_ARG
+    if args.silence_timeout is not None and args.silence_timeout <= 0:
+        emit(result("monitor start", False, error=err_obj("ValueError", "--silence-timeout must be greater than zero", "Use a positive number of seconds.")), args.json)
+        return EXIT_ARG
+    webhook_url = args.alert_webhook or (os.environ.get(args.alert_webhook_env) if args.alert_webhook_env else None)
+    try:
+        compile_alert_patterns(args.alert)
+        if webhook_url:
+            parsed = urllib.parse.urlparse(webhook_url)
+            if parsed.scheme not in ("http", "https") or not parsed.netloc:
+                raise ValueError("--alert-webhook must be an absolute http(s) URL")
+    except (re.error, ValueError) as exc:
+        emit(result("monitor start", False, error=err_obj(type(exc).__name__, exc, "Fix the alert configuration.")), args.json)
+        return EXIT_ARG
     session_id = args.session or f"serial-{uuid.uuid4().hex[:12]}"
     try:
         root, session_file, event_log, raw_log = session_paths(session_id)
     except ValueError as exc:
         emit(result("monitor start", False, error=err_obj("ValueError", exc, "Use only letters, digits, underscore, dash, and dot in session names.")), args.json)
         return EXIT_ARG
+    if args.log_dir:
+        log_dir = Path(args.log_dir).expanduser().resolve()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        raw_log = log_dir / f"{session_id}.raw.log"
     if root.exists() and any(root.iterdir()):
         emit(result("monitor start", False, data={"session_id": session_id}, error=err_obj("ExistingSession", session_id, "Choose a new --session value or stop/poll the existing session.")), args.json)
         return EXIT_ARG
     root.mkdir(parents=True, exist_ok=True)
-    cmd = [sys.executable, str(Path(__file__).resolve()), "_monitor_worker", "--session", session_id, "--port", args.port, "--baud", str(args.baud), "--bytesize", str(args.bytesize), "--parity", args.parity, "--stopbits", str(args.stopbits), "--timeout", str(args.timeout), "--encoding", args.encoding, "--chunk-size", str(args.chunk_size)]
+    cmd = [
+        sys.executable, str(Path(__file__).resolve()), "_monitor_worker",
+        "--session", session_id,
+        "--port", args.port,
+        "--baud", str(args.baud),
+        "--bytesize", str(args.bytesize),
+        "--parity", args.parity,
+        "--stopbits", str(args.stopbits),
+        "--timeout", str(args.timeout),
+        "--encoding", args.encoding,
+        "--chunk-size", str(args.chunk_size),
+        "--log-path", str(raw_log),
+        "--log-max-bytes", str(args.log_max_bytes),
+        "--log-backups", str(args.log_backups),
+        "--reconnect-delay", str(args.reconnect_delay),
+        "--reconnect-max-attempts", str(args.reconnect_max_attempts),
+        "--alert-cooldown", str(args.alert_cooldown),
+        "--webhook-timeout", str(args.webhook_timeout),
+    ]
+    if args.silence_timeout:
+        cmd.extend(["--silence-timeout", str(args.silence_timeout)])
+    if args.reconnect:
+        cmd.append("--reconnect")
+    for pattern in args.alert or []:
+        cmd.extend(["--alert", pattern])
     if args.rtscts:
         cmd.append("--rtscts")
     if args.dsrdtr:
         cmd.append("--dsrdtr")
-    kwargs = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "cwd": str(root)}
+    worker_env = os.environ.copy()
+    if webhook_url:
+        worker_env[ALERT_WEBHOOK_ENV] = webhook_url
+    kwargs = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "cwd": str(root),
+        "env": worker_env,
+    }
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
     else:
         kwargs["start_new_session"] = True
     proc = subprocess.Popen(cmd, **kwargs)
-    meta = {"session_id": session_id, "pid": proc.pid, "port": args.port, "baud": args.baud, "event_log": str(event_log), "raw_log": str(raw_log), "started_at": now_iso()}
+    meta = {
+        "session_id": session_id,
+        "pid": proc.pid,
+        "port": args.port,
+        "baud": args.baud,
+        "event_log": str(event_log),
+        "raw_log": str(raw_log),
+        "log_max_bytes": args.log_max_bytes,
+        "log_backups": args.log_backups,
+        "reconnect": args.reconnect,
+        "alert_patterns": args.alert or [],
+        "silence_timeout": args.silence_timeout,
+        "alert_webhook_configured": bool(webhook_url),
+        "started_at": now_iso(),
+    }
     write_json(session_file, meta)
 
     deadline = time.time() + args.startup_timeout
@@ -522,8 +685,17 @@ def cmd_monitor_status(args):
         emit(result("monitor status", False, error=err_obj("UnknownSession", args.session, "Check the session_id from monitor start.")), args.json)
         return EXIT_ARG
     meta = read_json(session_file)
+    raw_log = Path(meta.get("raw_log", raw_log))
     events, offset = iter_events(event_log, 0)
-    meta.update({"alive": pid_alive(meta.get("pid")), "event_count": len(events), "event_log_size": offset, "raw_log_size": raw_log.stat().st_size if raw_log.exists() else 0, "last_event": events[-1] if events else None})
+    rotated_logs = sorted(raw_log.parent.glob(f"{raw_log.name}.*")) if raw_log.parent.exists() else []
+    meta.update({
+        "alive": pid_alive(meta.get("pid")),
+        "event_count": len(events),
+        "event_log_size": offset,
+        "raw_log_size": raw_log.stat().st_size if raw_log.exists() else 0,
+        "rotated_raw_logs": [str(path) for path in rotated_logs],
+        "last_event": events[-1] if events else None,
+    })
     emit(result("monitor status", True, meta), args.json)
     return 0
 
@@ -538,6 +710,7 @@ def cmd_monitor_stop(args):
         emit(result("monitor stop", False, error=err_obj("UnknownSession", args.session, "Check the session_id from monitor start.")), args.json)
         return EXIT_ARG
     meta = read_json(session_file)
+    raw_log = Path(meta.get("raw_log", raw_log))
     pid = meta.get("pid")
     stopped = False
     if pid and pid_alive(pid):
@@ -550,12 +723,60 @@ def cmd_monitor_stop(args):
 def cmd_monitor_worker(args):
     if not require_pyserial("_monitor_worker", True):
         return EXIT_DEP
-    root, session_file, event_log, raw_log = session_paths(args.session)
+    root, session_file, event_log, default_raw_log = session_paths(args.session)
+    raw_log = Path(args.log_path).expanduser().resolve() if args.log_path else default_raw_log
     root.mkdir(parents=True, exist_ok=True)
+    event_lock = threading.Lock()
+
     def event_writer(ev):
         ev.setdefault("session_id", args.session)
-        with event_log.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(ev, ensure_ascii=False, separators=(",", ":")) + "\n")
+        with event_lock:
+            with event_log.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(ev, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+    try:
+        patterns = compile_alert_patterns(args.alert)
+    except re.error as exc:
+        event_writer({"event": "error", "error": err_obj("InvalidRegex", exc, "Fix the --alert regular expression."), "time": now_iso()})
+        return EXIT_ARG
+
+    webhook_url = os.environ.get(ALERT_WEBHOOK_ENV)
+    last_alert_at = {}
+
+    def dispatch_alert(alert):
+        key = alert.get("pattern") or alert.get("kind") or "alert"
+        current = time.monotonic()
+        if current - last_alert_at.get(key, float("-inf")) < args.alert_cooldown:
+            return
+        last_alert_at[key] = current
+        event_writer(alert)
+        if webhook_url:
+            try:
+                status = post_alert_webhook(webhook_url, alert, args.webhook_timeout)
+                event_writer({"event": "notification", "channel": "webhook", "status": status, "alert_kind": alert.get("kind"), "time": now_iso()})
+            except Exception as exc:
+                event_writer({"event": "notification_error", "channel": "webhook", "error": err_obj(type(exc).__name__, exc, "Check the webhook URL and network access."), "time": now_iso()})
+
+    def monitored_event_writer(ev):
+        if ev.get("event") == "alert":
+            dispatch_alert(ev)
+            return
+        event_writer(ev)
+        if ev.get("event") == "line":
+            line = ev.get("line", "")
+            for name, source, pattern in patterns:
+                match = pattern.search(line)
+                if match:
+                    dispatch_alert({
+                        "event": "alert",
+                        "kind": "pattern",
+                        "rule": name,
+                        "pattern": source,
+                        "match": match.group(0),
+                        "line": line,
+                        "time": now_iso(),
+                    })
+
     args.log = str(raw_log)
     args.jsonl = False
     args.json = True
@@ -565,13 +786,27 @@ def cmd_monitor_worker(args):
     args.max_bytes = None
     args.max_lines = None
     args.expect = None
-    try:
-        with open_serial(args) as ser:
-            read_loop(args, ser, "monitor", event_writer)
-        return 0
-    except Exception as exc:
-        event_writer({"event": "error", "error": err_obj(type(exc).__name__, exc, "Check serial settings and device connection."), "time": now_iso()})
-        return EXIT_IO
+    attempts = 0
+    while True:
+        try:
+            with open_serial(args) as ser:
+                attempts = 0
+                read_loop(args, ser, "monitor", monitored_event_writer)
+            return 0
+        except Exception as exc:
+            attempts += 1
+            error = err_obj(type(exc).__name__, exc, "Check serial settings and device connection.")
+            if not args.reconnect or (args.reconnect_max_attempts and attempts > args.reconnect_max_attempts):
+                event_writer({"event": "error", "error": error, "attempt": attempts, "time": now_iso()})
+                return EXIT_IO
+            event_writer({
+                "event": "reconnect_wait",
+                "error": error,
+                "attempt": attempts,
+                "delay_seconds": args.reconnect_delay,
+                "time": now_iso(),
+            })
+            time.sleep(args.reconnect_delay)
 
 
 def cmd_terminal(args):
@@ -679,7 +914,24 @@ def build_parser():
     mon = sub.add_parser("monitor")
     mon_sub = mon.add_subparsers(dest="monitor_cmd", required=True)
     p = mon_sub.add_parser("start")
-    add_serial_args(p); add_output_args(p); p.add_argument("--session"); p.add_argument("--encoding", default="utf-8", choices=["utf-8", "latin-1", "ascii", "hex"]); p.add_argument("--chunk-size", type=int, default=256); p.add_argument("--startup-timeout", type=float, default=2.0); p.set_defaults(func=cmd_monitor_start)
+    add_serial_args(p); add_output_args(p)
+    p.add_argument("--session")
+    p.add_argument("--encoding", default="utf-8", choices=["utf-8", "latin-1", "ascii", "hex"])
+    p.add_argument("--chunk-size", type=int, default=256)
+    p.add_argument("--startup-timeout", type=float, default=2.0)
+    p.add_argument("--log-dir", help="persistent directory for raw logs; session metadata remains in the system temp directory")
+    p.add_argument("--log-max-bytes", type=int, default=0, help="rotate raw log at this size; 0 disables rotation")
+    p.add_argument("--log-backups", type=int, default=3)
+    p.add_argument("--reconnect", action="store_true", help="retry after serial open/read failures")
+    p.add_argument("--reconnect-delay", type=float, default=2.0)
+    p.add_argument("--reconnect-max-attempts", type=int, default=0, help="0 retries forever")
+    p.add_argument("--alert", action="append", default=[], metavar="REGEX", help="emit an alert event for matching lines; repeatable")
+    p.add_argument("--silence-timeout", type=float, help="emit one alert after this many seconds without data")
+    p.add_argument("--alert-cooldown", type=float, default=30.0)
+    p.add_argument("--alert-webhook", help="POST alert JSON to an http(s) endpoint; kept out of session metadata")
+    p.add_argument("--alert-webhook-env", help="read the webhook URL from this environment variable")
+    p.add_argument("--webhook-timeout", type=float, default=3.0)
+    p.set_defaults(func=cmd_monitor_start)
     p = mon_sub.add_parser("poll")
     add_output_args(p); p.add_argument("--session", required=True); p.add_argument("--since", type=int, default=0); p.set_defaults(func=cmd_monitor_poll)
     p = mon_sub.add_parser("wait")
@@ -690,7 +942,19 @@ def build_parser():
     add_output_args(p); p.add_argument("--session", required=True); p.set_defaults(func=cmd_monitor_stop)
 
     p = sub.add_parser("_monitor_worker")
-    add_serial_args(p); add_read_args(p); p.add_argument("--session", required=True); p.set_defaults(func=cmd_monitor_worker)
+    add_serial_args(p); add_read_args(p)
+    p.add_argument("--session", required=True)
+    p.add_argument("--log-path")
+    p.add_argument("--log-max-bytes", type=int, default=0)
+    p.add_argument("--log-backups", type=int, default=3)
+    p.add_argument("--reconnect", action="store_true")
+    p.add_argument("--reconnect-delay", type=float, default=2.0)
+    p.add_argument("--reconnect-max-attempts", type=int, default=0)
+    p.add_argument("--alert", action="append", default=[])
+    p.add_argument("--silence-timeout", type=float)
+    p.add_argument("--alert-cooldown", type=float, default=30.0)
+    p.add_argument("--webhook-timeout", type=float, default=3.0)
+    p.set_defaults(func=cmd_monitor_worker)
     return parser
 
 

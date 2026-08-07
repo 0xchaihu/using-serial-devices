@@ -25,6 +25,8 @@ Start `monitor` before foreground work that may trigger serial output. Poll afte
 
 Keep and reuse `next_offset` so each poll returns only new events. If `monitor start` returns `ok:false`, do not continue; inspect the structured error.
 
+For a long-running monitor, add a durable `--log-dir`, raw-log rotation, and explicit `--reconnect`. Add repeatable `--alert` patterns or `--silence-timeout` when the user defines failure conditions. Prefer `--alert-webhook-env` over a literal webhook URL. Read `long-running-monitoring.md` before configuring unattended startup or retention.
+
 ## Safety
 
 Do not send destructive commands blindly. For bootloaders, flash tools, factory reset commands, motor movement, voltage/current changes, or irreversible settings, show the exact payload and ask the user to confirm.

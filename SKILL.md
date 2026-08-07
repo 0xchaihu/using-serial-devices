@@ -1,6 +1,6 @@
 ---
 name: using-serial-devices
-description: Use when a coding agent needs to discover serial ports, choose among TTY/COM/UART devices, read or write serial data, debug embedded devices, collect serial logs, run AT/bootloader/REPL commands, maintain a serial monitor, or open a serial terminal across Windows, Linux, and macOS.
+description: Discover and safely interact with TTY/COM/UART serial devices across Windows, Linux, and macOS. Use when a coding agent needs to list or select ports, read or write serial data, debug embedded devices, collect persistent or rotating logs, run AT/bootloader/REPL commands, maintain a reconnecting background monitor, detect regex or silence alerts, send webhook notifications, or open a serial terminal.
 ---
 
 # Using Serial Devices
@@ -30,7 +30,7 @@ Run all operations through `scripts/serial_tool.py`:
 - `read --port PORT --baud BAUD [condition] --json|--jsonl`: capture incoming bytes.
 - `write --port PORT --baud BAUD (--text TEXT | --hex "01 02 0A") --newline none|lf|crlf|cr --json`: send text or raw bytes (`--text` and `--hex` are mutually exclusive; one is required).
 - `request --port PORT --baud BAUD (--text TEXT | --hex "01 02 0A") --newline lf|none|crlf|cr --expect REGEX --json`: send and wait for response (`--text` and `--hex` are mutually exclusive; one is required).
-- `monitor start|poll|wait|status|stop`: run a background serial reader and query it later.
+- `monitor start|poll|wait|status|stop`: run a background serial reader, query it later, and optionally persist, rotate, reconnect, and alert.
 - `terminal --port PORT --baud BAUD`: simple line-oriented human terminal; serial output is printed while stdin lines are forwarded, and `:exit` quits.
 
 JSON success shape: `{"ok":true,"command":"...","data":...}`.
@@ -75,7 +75,27 @@ Use `monitor` when the agent should continue foreground work while serial data i
 6. Stop capture at the end:
    `python scripts/serial_tool.py monitor stop --session SESSION --json`
 
-The monitor writes JSONL events and raw logs under the system temp directory. Event types include `open`, `data`, `line`, `match`, `error`, and `close`.
+The monitor writes JSONL control events under the system temp directory. By default the raw log is there too. Use `--log-dir PATH` to keep raw logs in a durable user-selected directory.
+
+For resilient monitoring, opt in explicitly:
+
+```bash
+python scripts/serial_tool.py monitor start --port COM5 --baud 115200 \
+  --session device-a --log-dir ./serial-logs \
+  --log-max-bytes 10485760 --log-backups 5 \
+  --reconnect --reconnect-delay 2 \
+  --alert "ERROR|FATAL|panic|watchdog|HardFault" \
+  --silence-timeout 60 --alert-cooldown 30 --json
+```
+
+- `--reconnect` retries serial open/read failures. `--reconnect-max-attempts 0` retries indefinitely.
+- `--log-max-bytes` rotates the raw log by size; `0` disables rotation.
+- Repeat `--alert REGEX` to create multiple line-oriented alert rules.
+- `--silence-timeout N` emits one alert after N seconds without serial data and rearms after data resumes.
+- `--alert-webhook URL` posts alert JSON. Prefer `--alert-webhook-env ENV_NAME` so secrets do not appear in the command line. Webhook failures become `notification_error` events and do not stop capture.
+- Keep `next_offset` from every `poll` or `wait`; alerts appear as `alert` events.
+
+Read `references/long-running-monitoring.md` before configuring unattended monitoring, retention, webhook delivery, or OS startup.
 
 ## Dependencies and platform notes
 

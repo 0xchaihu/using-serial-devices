@@ -12,6 +12,7 @@ This skill is designed for agent-friendly serial workflows: stable CLI commands,
 - Sends text or raw HEX bytes.
 - Sends a command and waits for a response in one request-response operation.
 - Runs a background serial monitor and lets an agent poll or wait for new events.
+- Supports durable raw logs, size rotation, reconnect loops, regex/silence alerts, and webhook delivery.
 - Provides a simple line-oriented terminal for manual debugging.
 
 ## Requirements
@@ -209,6 +210,22 @@ python scripts/serial_tool.py monitor stop --session SESSION_ID --json
 ```
 
 Background monitor sessions store JSONL events and raw serial logs under the system temporary directory.
+
+For resilient monitoring with persistent rotating logs:
+
+```powershell
+$env:SERIAL_ALERT_URL = "https://example.invalid/secret-webhook"
+python scripts/serial_tool.py monitor start `
+  --port COM5 --baud 115200 --session device-a `
+  --log-dir .\serial-logs --log-max-bytes 10485760 --log-backups 5 `
+  --reconnect --reconnect-delay 2 `
+  --alert "ERROR|FATAL|panic|watchdog|HardFault" `
+  --silence-timeout 60 --alert-webhook-env SERIAL_ALERT_URL --json
+```
+
+`--reconnect` is opt-in. A retry is recorded as `reconnect_wait`; matched lines and silence conditions produce `alert` events. Webhook delivery failures produce `notification_error` without stopping serial capture. The webhook URL is not written to session metadata.
+
+Raw logs supplied through `--log-dir` persist outside the temporary session directory and rotate to `.1`, `.2`, and later backups. JSONL control events remain unrotated so `poll --since` byte offsets stay stable.
 
 ## Terminal Mode
 
