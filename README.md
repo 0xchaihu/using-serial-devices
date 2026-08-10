@@ -183,7 +183,7 @@ Start a monitor:
 python scripts/serial_tool.py monitor start --port COM5 --baud 115200 --json
 ```
 
-The command returns a `session_id`, an `event_log`, a `raw_log`, and a `next_offset`.
+The command returns a `session_id`, an `event_log`, a `raw_log`, a `timestamped_log`, and a `next_offset`.
 
 Poll for new events without blocking:
 
@@ -225,7 +225,17 @@ python scripts/serial_tool.py monitor start `
 
 `--reconnect` is opt-in. A retry is recorded as `reconnect_wait`; matched lines and silence conditions produce `alert` events. Webhook delivery failures produce `notification_error` without stopping serial capture. The webhook URL is not written to session metadata.
 
-Raw logs supplied through `--log-dir` persist outside the temporary session directory and rotate to `.1`, `.2`, and later backups. JSONL control events remain unrotated so `poll --since` byte offsets stay stable.
+Raw logs supplied through `--log-dir` persist outside the temporary session directory. Each monitor also creates a UTF-8 timestamped line log in the requested format:
+
+```text
+[2026-08-07 10:53:34.187] ======
+[2026-08-07 10:53:34.187] @20220927-11325382
+[2026-08-07 10:53:34.198] NI2C
+```
+
+For session `device-a`, the files are `device-a.raw.log` and `device-a.log`. Both rotate to `.1`, `.2`, and later backups. JSONL control events remain unrotated so `poll --since` byte offsets stay stable. `read`, `request`, and `terminal` also derive a timestamped companion whenever `--log` is supplied; pass `--timestamped-log` to override its path.
+
+Adjacent mixed endings (`\r\n` or `\n\r`) are normalized to one line break, even across serial read boundaries. Repeated identical endings remain separate so intentional blank lines are preserved.
 
 ## Terminal Mode
 

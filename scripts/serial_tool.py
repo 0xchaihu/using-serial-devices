@@ -44,6 +44,11 @@ def now_iso():
     return _dt.datetime.now(_dt.timezone.utc).isoformat()
 
 
+def now_log_timestamp():
+    current = _dt.datetime.now().astimezone()
+    return f"{current:%Y-%m-%d %H:%M:%S}.{current.microsecond // 1000:03d}"
+
+
 def emit(obj, json_mode=True):
     if json_mode:
         print(json.dumps(obj, ensure_ascii=False, separators=(",", ":")), flush=True)
@@ -100,6 +105,29 @@ def append_newline(payload, newline):
     return payload + suffix
 
 
+def split_complete_lines(buffer, text, pending_terminator=None):
+    """Return lines while collapsing CRLF or LFCR pairs into one terminator."""
+    if pending_terminator and text:
+        if text[0] in ("\r", "\n") and text[0] != pending_terminator:
+            text = text[1:]
+        pending_terminator = None
+    combined = buffer + text
+    lines = []
+    start = 0
+    index = 0
+    while index < len(combined):
+        char = combined[index]
+        if char in ("\r", "\n"):
+            lines.append(combined[start:index])
+            if index + 1 < len(combined) and combined[index + 1] in ("\r", "\n") and combined[index + 1] != char:
+                index += 1
+            elif index + 1 == len(combined):
+                pending_terminator = char
+            start = index + 1
+        index += 1
+    return lines, combined[start:], pending_terminator
+
+
 def open_serial(args):
     return serial.Serial(
         port=args.port,
@@ -152,11 +180,49 @@ class RotatingBinaryLog:
         self._file.close()
 
 
+class TimestampedTextLog:
+    """UTF-8 line log prefixed with local time to millisecond precision."""
+
+    def __init__(self, path, max_bytes=0, backups=3):
+        self.log = RotatingBinaryLog(path, max_bytes, backups)
+
+    def write_line(self, line, timestamp=None):
+        stamp = timestamp or now_log_timestamp()
+        self.log.write(f"[{stamp}] {line}\n".encode("utf-8"))
+
+    def close(self):
+        self.log.close()
+
+
+def derive_timestamped_log_path(raw_path):
+    path = Path(raw_path)
+    if path.name == "raw.log":
+        return path.with_name("timestamped.log")
+    if path.name.endswith(".raw.log"):
+        return path.with_name(f"{path.name[:-8]}.log")
+    return path.with_name(f"{path.name}.timestamped.log")
+
+
 def open_raw_log(args):
     if not getattr(args, "log", None):
         return None
     return RotatingBinaryLog(
         args.log,
+        getattr(args, "log_max_bytes", 0),
+        getattr(args, "log_backups", 3),
+    )
+
+
+def open_timestamped_log(args):
+    path = getattr(args, "timestamped_log", None)
+    if not path and getattr(args, "log", None):
+        path = derive_timestamped_log_path(args.log)
+    if not path:
+        return None
+    if getattr(args, "log", None) and Path(path).resolve() == Path(args.log).resolve():
+        raise ValueError("timestamped log path must differ from the raw log path")
+    return TimestampedTextLog(
+        path,
         getattr(args, "log_max_bytes", 0),
         getattr(args, "log_backups", 3),
     )
@@ -237,10 +303,12 @@ def read_loop(args, ser, command="read", event_writer=None):
     text_acc = ""
     match_buf = ""
     line_buf = ""
+    pending_terminator = None
     pattern = re.compile(args.expect) if args.expect else None
     matched = None
     reason = "completed"
     raw_log = open_raw_log(args)
+    timestamped_log = open_timestamped_log(args)
     retain_history = event_writer is None and not args.jsonl
     silence_emitted = False
 
@@ -250,9 +318,11 @@ def read_loop(args, ser, command="read", event_writer=None):
         elif args.jsonl:
             emit(ev, True)
 
-    def emit_line(line):
+    def emit_line(line, log_timestamp=None):
         nonlocal lines, matched
         lines += 1
+        if timestamped_log:
+            timestamped_log.write_line(line, log_timestamp)
         line_ev = {"event": "line", "line": line, "time": now_iso()}
         write_event(line_ev)
         if pattern and pattern.search(line):
@@ -274,24 +344,20 @@ def read_loop(args, ser, command="read", event_writer=None):
                     raw_log.write(data)
                     raw_log.flush()
                 text = decode_bytes(data, args.encoding)
+                chunk_log_timestamp = now_log_timestamp() if timestamped_log else None
                 if retain_history:
                     text_acc += text
                     chunks.append({"time": now_iso(), "bytes": len(data), "text": text, "hex": data.hex(" ")})
                 ev = {"event": "data", "bytes": len(data), "text": text, "hex": data.hex(" "), "time": now_iso()}
                 write_event(ev)
 
-                line_buf += text
-                parts = line_buf.splitlines(keepends=True)
-                if parts and not (parts[-1].endswith("\n") or parts[-1].endswith("\r")):
-                    line_buf = parts.pop()
-                else:
-                    line_buf = ""
+                parts, line_buf, pending_terminator = split_complete_lines(line_buf, text, pending_terminator)
                 if len(line_buf) > MATCH_BUFFER_LIMIT:
                     dropped = len(line_buf) - MATCH_BUFFER_LIMIT
                     line_buf = line_buf[-MATCH_BUFFER_LIMIT:]
                     write_event({"event": "buffer_truncated", "buffer": "line", "dropped_characters": dropped, "time": now_iso()})
                 for part in parts:
-                    emit_line(part.rstrip("\r\n"))
+                    emit_line(part, chunk_log_timestamp)
 
                 if pattern and not matched:
                     match_buf = (match_buf + text)[-MATCH_BUFFER_LIMIT:]
@@ -327,8 +393,12 @@ def read_loop(args, ser, command="read", event_writer=None):
                 reason = "no_condition"
                 break
     finally:
+        if line_buf and timestamped_log:
+            timestamped_log.write_line(line_buf)
         if raw_log:
             raw_log.close()
+        if timestamped_log:
+            timestamped_log.close()
     duration = int((time.time() - started) * 1000)
     data = {"port": args.port, "baud": args.baud, "received_bytes": total, "lines": lines, "partial_line": line_buf, "text": text_acc, "hex": bytes(all_bytes).hex(" "), "matched": matched is not None, "match": matched, "reason": reason, "duration_ms": duration, "chunks": chunks}
     if line_buf:
@@ -465,6 +535,7 @@ def cmd_monitor_start(args):
         log_dir = Path(args.log_dir).expanduser().resolve()
         log_dir.mkdir(parents=True, exist_ok=True)
         raw_log = log_dir / f"{session_id}.raw.log"
+    timestamped_log = derive_timestamped_log_path(raw_log)
     if root.exists() and any(root.iterdir()):
         emit(result("monitor start", False, data={"session_id": session_id}, error=err_obj("ExistingSession", session_id, "Choose a new --session value or stop/poll the existing session.")), args.json)
         return EXIT_ARG
@@ -481,6 +552,7 @@ def cmd_monitor_start(args):
         "--encoding", args.encoding,
         "--chunk-size", str(args.chunk_size),
         "--log-path", str(raw_log),
+        "--timestamped-log", str(timestamped_log),
         "--log-max-bytes", str(args.log_max_bytes),
         "--log-backups", str(args.log_backups),
         "--reconnect-delay", str(args.reconnect_delay),
@@ -520,6 +592,7 @@ def cmd_monitor_start(args):
         "baud": args.baud,
         "event_log": str(event_log),
         "raw_log": str(raw_log),
+        "timestamped_log": str(timestamped_log),
         "log_max_bytes": args.log_max_bytes,
         "log_backups": args.log_backups,
         "reconnect": args.reconnect,
@@ -686,14 +759,18 @@ def cmd_monitor_status(args):
         return EXIT_ARG
     meta = read_json(session_file)
     raw_log = Path(meta.get("raw_log", raw_log))
+    timestamped_log = Path(meta.get("timestamped_log", derive_timestamped_log_path(raw_log)))
     events, offset = iter_events(event_log, 0)
     rotated_logs = sorted(raw_log.parent.glob(f"{raw_log.name}.*")) if raw_log.parent.exists() else []
+    rotated_timestamped_logs = sorted(timestamped_log.parent.glob(f"{timestamped_log.name}.*")) if timestamped_log.parent.exists() else []
     meta.update({
         "alive": pid_alive(meta.get("pid")),
         "event_count": len(events),
         "event_log_size": offset,
         "raw_log_size": raw_log.stat().st_size if raw_log.exists() else 0,
         "rotated_raw_logs": [str(path) for path in rotated_logs],
+        "timestamped_log_size": timestamped_log.stat().st_size if timestamped_log.exists() else 0,
+        "rotated_timestamped_logs": [str(path) for path in rotated_timestamped_logs],
         "last_event": events[-1] if events else None,
     })
     emit(result("monitor status", True, meta), args.json)
@@ -711,12 +788,13 @@ def cmd_monitor_stop(args):
         return EXIT_ARG
     meta = read_json(session_file)
     raw_log = Path(meta.get("raw_log", raw_log))
+    timestamped_log = Path(meta.get("timestamped_log", derive_timestamped_log_path(raw_log)))
     pid = meta.get("pid")
     stopped = False
     if pid and pid_alive(pid):
         stopped = terminate_pid(pid)
     events, offset = iter_events(event_log, 0)
-    emit(result("monitor stop", True, {"session_id": args.session, "pid": pid, "stopped": stopped, "event_count": len(events), "event_log": str(event_log), "raw_log": str(raw_log)}), args.json)
+    emit(result("monitor stop", True, {"session_id": args.session, "pid": pid, "stopped": stopped, "event_count": len(events), "event_log": str(event_log), "raw_log": str(raw_log), "timestamped_log": str(timestamped_log)}), args.json)
     return 0
 
 
@@ -814,9 +892,13 @@ def cmd_terminal(args):
         return EXIT_DEP
     emit("Starting serial terminal. Type :exit or press Ctrl+C to quit.", False)
     stop = threading.Event()
-    raw_log = open(args.log, "ab") if args.log else None
+    raw_log = open_raw_log(args)
+    timestamped_log = open_timestamped_log(args)
+    line_buf = ""
+    pending_terminator = None
 
     def reader(ser):
+        nonlocal line_buf, pending_terminator
         while not stop.is_set():
             try:
                 data = ser.read(max(1, ser.in_waiting or 1))
@@ -828,7 +910,13 @@ def cmd_terminal(args):
                 if raw_log:
                     raw_log.write(data)
                     raw_log.flush()
-                sys.stdout.write(decode_bytes(data, args.encoding))
+                text = decode_bytes(data, args.encoding)
+                if timestamped_log:
+                    chunk_log_timestamp = now_log_timestamp()
+                    parts, line_buf, pending_terminator = split_complete_lines(line_buf, text, pending_terminator)
+                    for part in parts:
+                        timestamped_log.write_line(part, chunk_log_timestamp)
+                sys.stdout.write(text)
                 sys.stdout.flush()
 
     try:
@@ -851,8 +939,12 @@ def cmd_terminal(args):
         emit(result("terminal", False, error=err_obj("SerialException", exc, "Check the port and permissions.")), True)
         return EXIT_IO
     finally:
+        if line_buf and timestamped_log:
+            timestamped_log.write_line(line_buf)
         if raw_log:
             raw_log.close()
+        if timestamped_log:
+            timestamped_log.close()
 
 def add_serial_args(p):
     p.add_argument("--port", required=True)
@@ -878,6 +970,7 @@ def add_read_args(p):
     p.add_argument("--forever", action="store_true")
     p.add_argument("--jsonl", action="store_true")
     p.add_argument("--log")
+    p.add_argument("--timestamped-log", help="UTF-8 line log with [YYYY-MM-DD HH:MM:SS.mmm] prefixes; derived automatically when --log is used")
     p.add_argument("--encoding", default="utf-8", choices=["utf-8", "latin-1", "ascii", "hex"])
     p.add_argument("--chunk-size", type=int, default=256)
 
@@ -908,7 +1001,7 @@ def build_parser():
     p.set_defaults(func=cmd_request)
 
     p = sub.add_parser("terminal")
-    add_serial_args(p); add_output_args(p); p.add_argument("--encoding", default="utf-8", choices=["utf-8", "latin-1", "ascii", "hex"]); p.add_argument("--log")
+    add_serial_args(p); add_output_args(p); p.add_argument("--encoding", default="utf-8", choices=["utf-8", "latin-1", "ascii", "hex"]); p.add_argument("--log"); p.add_argument("--timestamped-log", help="UTF-8 line log with [YYYY-MM-DD HH:MM:SS.mmm] prefixes; derived automatically when --log is used")
     p.set_defaults(func=cmd_terminal)
 
     mon = sub.add_parser("monitor")
@@ -919,8 +1012,8 @@ def build_parser():
     p.add_argument("--encoding", default="utf-8", choices=["utf-8", "latin-1", "ascii", "hex"])
     p.add_argument("--chunk-size", type=int, default=256)
     p.add_argument("--startup-timeout", type=float, default=2.0)
-    p.add_argument("--log-dir", help="persistent directory for raw logs; session metadata remains in the system temp directory")
-    p.add_argument("--log-max-bytes", type=int, default=0, help="rotate raw log at this size; 0 disables rotation")
+    p.add_argument("--log-dir", help="persistent directory for raw and timestamped logs; session metadata remains in the system temp directory")
+    p.add_argument("--log-max-bytes", type=int, default=0, help="rotate raw and timestamped logs at this size; 0 disables rotation")
     p.add_argument("--log-backups", type=int, default=3)
     p.add_argument("--reconnect", action="store_true", help="retry after serial open/read failures")
     p.add_argument("--reconnect-delay", type=float, default=2.0)

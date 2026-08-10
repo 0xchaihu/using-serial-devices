@@ -10,7 +10,7 @@
 
 ## Production preset
 
-Use a named session and an absolute durable log directory. Keep control events in the session directory returned by `monitor start`; archive raw logs from `--log-dir`.
+Use a named session and an absolute durable log directory. Keep control events in the session directory returned by `monitor start`; archive both the exact raw log and the readable timestamped log from `--log-dir`.
 
 ```powershell
 $env:SERIAL_ALERT_URL = "https://example.invalid/secret-webhook"
@@ -36,7 +36,10 @@ Treat `notification_error` as a delivery failure, not a serial capture failure. 
 
 ## Retention and recovery
 
-Raw logs rotate to `.1`, `.2`, and so on when `--log-max-bytes` is exceeded. `monitor status` reports the active and rotated raw logs. Rotation is disabled when the size is `0` or the backup count is `0`.
+Raw and timestamped logs rotate independently to `.1`, `.2`, and so on when `--log-max-bytes` is exceeded. `monitor status` reports both active files and their rotated backups. Rotation is disabled when the size is `0` or the backup count is `0`.
+
+The timestamped log uses local system time and UTF-8. Every complete decoded line, including an empty line, is written as `[YYYY-MM-DD HH:MM:SS.mmm] TEXT`. The raw log remains unchanged for byte-exact diagnosis.
+Mixed adjacent line-ending pairs (`\r\n` and `\n\r`) produce one line break even when split across reads. Repeated identical terminators still represent separate lines.
 
 `--reconnect` covers serial open and read failures. A `reconnect_wait` event records each retry. A successful open resets the consecutive retry count. Set a finite `--reconnect-max-attempts` when a permanently missing device should cause the monitor to exit.
 
@@ -52,5 +55,5 @@ Before enabling startup, test the wrapper interactively, disconnect and reconnec
 
 - One process must own a serial port at a time.
 - A detached monitor cannot actively wake a completed coding-agent task; use webhook delivery or an external scheduler for that boundary.
-- Size rotation applies to raw serial logs. JSONL control events are not rotated so byte offsets used by `poll --since` remain stable.
+- Size rotation applies to raw and timestamped serial logs. JSONL control events are not rotated so byte offsets used by `poll --since` remain stable.
 - Pattern matching depends on the selected decoding. Use `--encoding hex` for binary protocols and prefer protocol-aware tooling when line regexes are insufficient.

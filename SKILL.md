@@ -27,7 +27,7 @@ Run all operations through `scripts/serial_tool.py`:
 
 - `list --json`: return available ports with `port`, `description`, `hwid`, `vid`, `pid`, `serial_number`, `manufacturer`, and `product`.
 - `probe --port PORT --baud BAUD --json`: open and close the port to verify access.
-- `read --port PORT --baud BAUD [condition] --json|--jsonl`: capture incoming bytes.
+- `read --port PORT --baud BAUD [condition] --json|--jsonl`: capture incoming bytes; `--log PATH` also creates a timestamped companion log.
 - `write --port PORT --baud BAUD (--text TEXT | --hex "01 02 0A") --newline none|lf|crlf|cr --json`: send text or raw bytes (`--text` and `--hex` are mutually exclusive; one is required).
 - `request --port PORT --baud BAUD (--text TEXT | --hex "01 02 0A") --newline lf|none|crlf|cr --expect REGEX --json`: send and wait for response (`--text` and `--hex` are mutually exclusive; one is required).
 - `monitor start|poll|wait|status|stop`: run a background serial reader, query it later, and optionally persist, rotate, reconnect, and alert.
@@ -75,7 +75,16 @@ Use `monitor` when the agent should continue foreground work while serial data i
 6. Stop capture at the end:
    `python scripts/serial_tool.py monitor stop --session SESSION --json`
 
-The monitor writes JSONL control events under the system temp directory. By default the raw log is there too. Use `--log-dir PATH` to keep raw logs in a durable user-selected directory.
+The monitor writes JSONL control events, an exact raw byte log, and a UTF-8 line log prefixed with local timestamps to millisecond precision. With `--log-dir PATH`, `device-a.raw.log` preserves bytes and `device-a.log` contains readable lines such as:
+
+```text
+[2026-08-07 10:53:34.187] ======
+[2026-08-07 10:53:34.187] @20220927-11325382
+[2026-08-07 10:53:34.198] NI2C
+```
+
+Without `--log-dir`, both logs stay in the temporary session directory. `monitor start`, `status`, and `stop` return `raw_log` and `timestamped_log` paths.
+Treat adjacent mixed line endings (`\r\n` or `\n\r`) as one line break, including when the pair is split across serial reads. Preserve repeated identical endings (`\n\n` or `\r\r`) as intentional blank lines.
 
 For resilient monitoring, opt in explicitly:
 
@@ -89,7 +98,8 @@ python scripts/serial_tool.py monitor start --port COM5 --baud 115200 \
 ```
 
 - `--reconnect` retries serial open/read failures. `--reconnect-max-attempts 0` retries indefinitely.
-- `--log-max-bytes` rotates the raw log by size; `0` disables rotation.
+- `--log-max-bytes` rotates both raw and timestamped logs by size; `0` disables rotation.
+- For `read`, `request`, or `terminal`, supplying `--log PATH` automatically creates a timestamped companion; use `--timestamped-log PATH` to choose its exact location.
 - Repeat `--alert REGEX` to create multiple line-oriented alert rules.
 - `--silence-timeout N` emits one alert after N seconds without serial data and rearms after data resumes.
 - `--alert-webhook URL` posts alert JSON. Prefer `--alert-webhook-env ENV_NAME` so secrets do not appear in the command line. Webhook failures become `notification_error` events and do not stop capture.

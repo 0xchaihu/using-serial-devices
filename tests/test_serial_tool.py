@@ -82,14 +82,18 @@ class SerialToolTests(unittest.TestCase):
         old_root = serial_tool.SESSION_ROOT
         old_open = serial_tool.open_serial
         old_serial = serial_tool.serial
+        old_now_log_timestamp = serial_tool.now_log_timestamp
         event_log = RUNTIME / "test-alert" / "events.jsonl"
         raw_log = RUNTIME / "test-alert" / "raw.log"
+        timestamped_log = RUNTIME / "test-alert" / "timestamped.log"
         event_log.unlink(missing_ok=True)
         raw_log.unlink(missing_ok=True)
+        timestamped_log.unlink(missing_ok=True)
         serial_tool.SESSION_ROOT = RUNTIME
         serial_tool.serial = object()
+        serial_tool.now_log_timestamp = lambda: "2026-08-07 10:53:34.187"
         serial_tool.open_serial = lambda _args: FakeSerial([
-            b"boot ok\nERROR exploded\n",
+            b"======\n\nERROR exploded\n",
             OSError("device disconnected"),
         ])
         try:
@@ -108,12 +112,20 @@ class SerialToolTests(unittest.TestCase):
             self.assertTrue(alerts, events)
             self.assertEqual(alerts[0]["match"], "ERROR")
             self.assertEqual(alerts[0]["line"], "ERROR exploded")
+            self.assertEqual(
+                timestamped_log.read_text(encoding="utf-8"),
+                "[2026-08-07 10:53:34.187] ======\n"
+                "[2026-08-07 10:53:34.187] \n"
+                "[2026-08-07 10:53:34.187] ERROR exploded\n",
+            )
         finally:
             serial_tool.SESSION_ROOT = old_root
             serial_tool.open_serial = old_open
             serial_tool.serial = old_serial
+            serial_tool.now_log_timestamp = old_now_log_timestamp
             event_log.unlink(missing_ok=True)
             raw_log.unlink(missing_ok=True)
+            timestamped_log.unlink(missing_ok=True)
 
     def test_invalid_alert_regex_is_rejected(self):
         with self.assertRaises(Exception):
@@ -139,8 +151,10 @@ class SerialToolTests(unittest.TestCase):
         session_root = RUNTIME / "test-reconnect"
         event_log = session_root / "events.jsonl"
         raw_log = session_root / "raw.log"
+        timestamped_log = session_root / "timestamped.log"
         event_log.unlink(missing_ok=True)
         raw_log.unlink(missing_ok=True)
+        timestamped_log.unlink(missing_ok=True)
         opens = [
             OSError("not connected"),
             FakeSerial([b"ready\n", OSError("cable removed")]),
@@ -176,6 +190,35 @@ class SerialToolTests(unittest.TestCase):
             serial_tool.serial = old_serial
             event_log.unlink(missing_ok=True)
             raw_log.unlink(missing_ok=True)
+            timestamped_log.unlink(missing_ok=True)
+
+    def test_timestamped_log_path_is_derived_without_replacing_raw_log(self):
+        self.assertEqual(
+            serial_tool.derive_timestamped_log_path(Path("logs") / "device-a.raw.log"),
+            Path("logs") / "device-a.log",
+        )
+        self.assertEqual(
+            serial_tool.derive_timestamped_log_path(Path("session") / "raw.log"),
+            Path("session") / "timestamped.log",
+        )
+
+    def test_mixed_cr_lf_pairs_create_only_one_line_break(self):
+        lines, remainder, pending = serial_tool.split_complete_lines("", "first\r")
+        self.assertEqual(lines, ["first"])
+        lines, remainder, pending = serial_tool.split_complete_lines(remainder, "\nsecond\r\n\r\n", pending)
+        self.assertEqual(lines, ["second", ""])
+        self.assertEqual(remainder, "")
+        self.assertIsNone(pending)
+
+        lines, remainder, pending = serial_tool.split_complete_lines("", "third\n\rfourth\n")
+        self.assertEqual(lines, ["third", "fourth"])
+        self.assertEqual(remainder, "")
+        self.assertEqual(pending, "\n")
+
+        lines, remainder, pending = serial_tool.split_complete_lines(remainder, "\rfifth", pending)
+        self.assertEqual(lines, [])
+        self.assertEqual(remainder, "fifth")
+        self.assertIsNone(pending)
 
 
 if __name__ == "__main__":
