@@ -1,3 +1,4 @@
-display_name: Using Serial Devices
-short_description: Automate serial device I/O over TTY/COM ports.
-default_prompt: Help me monitor a serial device, interact with it safely, and return structured results.
+interface:
+  display_name: "Resilient Serial Devices"
+  short_description: "Monitor and automate serial devices safely"
+  default_prompt: "Use $using-serial-devices to monitor this serial device with persistent logs, reconnects, and alerts."
